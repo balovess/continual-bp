@@ -4,99 +4,111 @@ import torch.optim as optim
 import torch.nn.init as init
 
 class ContinualBackpropagation:
-    def __init__(self, model, reset_rate=0.001, maturity_threshold=100, utility_decay=0.9, reset_init='uniform'):
-        """
-        Initializes the Continual Backpropagation algorithm.
-
-        Args:
-            model (nn.Module): The neural network model.
-            reset_rate (float): The proportion of mature units to reset in each layer (rho).
-            maturity_threshold (int): The number of updates before a new unit is eligible for resetting (m).
-            utility_decay (float): The decay factor for the utility values (eta).
-            reset_init (str): The initialization method for reset weights ('uniform' or 'kaiming').
-        """
+    def __init__(self, model, optimizer=None, reset_rate=0.01, maturity_threshold=50, utility_decay=0.05,
+                 reset_init='uniform', enable_weighted_utility=True, reset_rates=None, momentum=0.9):
         self.model = model
+        self.optimizer = optimizer
         self.reset_rate = reset_rate
         self.maturity_threshold = maturity_threshold
         self.utility_decay = utility_decay
         self.reset_init = reset_init
+        self.enable_weighted_utility = enable_weighted_utility
+        self.reset_rates = reset_rates if reset_rates is not None else {name: self.reset_rate for name, _ in model.named_parameters()}
+        self.momentum = momentum
 
-        # Initialize utility and maturity trackers for weights only
-        self.utility = {name: torch.zeros_like(param) for name, param in model.named_parameters() if 'weight' in name}
-        self.maturity = {name: torch.zeros_like(param, dtype=torch.long) for name, param in model.named_parameters() if 'weight' in name}
-        self.accumulated_resets = {name: torch.tensor(0.0) for name in self.utility}
+        # Initialize utility, momentum, maturity, accumulated resets, and frozen mask
+        self.utility = {name: torch.zeros_like(param, device=param.device) for name, param in model.named_parameters()}
+        self.utility_momentum = {name: torch.zeros_like(param, device=param.device) for name, param in self.utility.items()}
+        self.maturity = {name: torch.zeros_like(param, dtype=torch.long, device=param.device) for name, param in self.utility.items()}
+        self.accumulated_resets = {name: 0.0 for name in self.utility}
+        self.is_frozen = {name: torch.zeros_like(param, dtype=torch.bool, device=param.device) for name, param in model.named_parameters()}
 
-    def update_utility(self):
-        """
-        Updates the utility values based on the current gradients and weights.
-        """
+    def update_utility(self, current_step, step_interval=1):
+        """Update the utility values for parameters based on their gradients."""
+        if current_step % step_interval != 0:
+            return
+        epsilon = 1e-8
         for name, param in self.model.named_parameters():
-            if 'weight' in name and hasattr(param, 'grad') and param.grad is not None:  # Ensure gradient exists
-                contribution = torch.abs(param.grad) * torch.abs(param)  # Element-wise utility calculation
-                self.utility[name] = self.utility_decay * self.utility[name] + (1 - self.utility_decay) * contribution
+            if param.grad is not None:
+                # Compute gradient contribution
+                grad_contribution = torch.abs(param.grad) * (torch.abs(param) + epsilon)
+
+                # If optimizer state exists, adjust gradient contribution accordingly
+                if self.optimizer is not None:
+                    state = self.optimizer.state[param]
+                    if 'momentum_buffer' in state:
+                        grad_contribution *= (torch.abs(state['momentum_buffer']) + epsilon)
+                    if 'exp_avg_sq' in state:
+                        grad_contribution /= (torch.sqrt(state.get('exp_avg_sq', torch.zeros_like(param))) + epsilon)
+
+                # Update utility with decay and momentum
+                self.utility[name] = self.utility_decay * self.utility[name] + (1 - self.utility_decay) * grad_contribution
+
+    def reset_weights(self, param, indices):
+        """Reset selected weights using the specified initialization strategy."""
+        if self.reset_init == 'uniform':
+            param.view(-1)[indices] = (torch.rand(indices.size(), device=param.device) - 0.5) * 0.1
+        elif self.reset_init == 'kaiming':
+            reshaped = param.flatten()[indices].view(len(indices), -1)
+            init.kaiming_uniform_(reshaped, nonlinearity='relu')
+            param.flatten()[indices] = reshaped.flatten()
+        elif self.reset_init == 'orthogonal' and len(indices) > 0:
+            temp = torch.randn(len(indices), device=param.device)
+            init.orthogonal_(temp.view(-1, 1))
+            param.flatten()[indices] = temp.flatten()
+        elif self.reset_init == 'normal':
+            param.view(-1)[indices] = torch.randn(indices.size(), device=param.device) * 0.1
+        elif self.reset_init == 'constant':
+            param.view(-1)[indices] = 0.0
 
     def selective_reset(self):
-        """
-        Selectively resets units with low utility and high maturity.
-        This function now robustly handles various parameter types (bias, weight, running_mean, running_var)
-        in BatchNorm, LayerNorm, and other modules, preventing IndexError.
-        """
+        """Selectively reset inefficient weights and apply freezing mechanism."""
         for name, param in self.model.named_parameters():
             if 'weight' in name:
                 utility_values = self.utility[name].flatten()
-                num_to_reset_float = self.reset_rate * len(utility_values)
-                self.accumulated_resets[name] += num_to_reset_float
-                num_to_reset = int(self.accumulated_resets[name].item())
-                self.accumulated_resets[name] -= num_to_reset
+                maturity_values = self.maturity[name].flatten()
 
-                if num_to_reset > 0:
-                    _, indices = torch.topk(utility_values, num_to_reset, largest=False)
-                    maturity_mask = self.maturity[name].flatten() >= self.maturity_threshold
-                    valid_indices = torch.masked_select(indices, maturity_mask[indices])
+                # Mark frozen weights based on their utility
+                freeze_threshold = torch.quantile(utility_values, 0.9)  # Freeze top 10% by utility
+                freeze_mask = utility_values > freeze_threshold
+                self.is_frozen[name].view(-1)[freeze_mask] = True
 
-                    if len(valid_indices) > 0:
-                        print(f"Resetting {name} with {len(valid_indices)} neurons")
-                        new_param = param.detach().clone()
-                        if self.reset_init == 'uniform':
-                            new_param.flatten()[valid_indices] = (torch.rand_like(new_param.flatten()[valid_indices]) - 0.5) * 0.02
-                        elif self.reset_init == 'kaiming':
-                            init.kaiming_uniform_(new_param.flatten()[valid_indices].view(len(valid_indices), -1), nonlinearity='relu')
-                        param.data.copy_(new_param)
+                # Filter unfrozen and mature weights
+                valid_mask = (~self.is_frozen[name].view(-1)) & (maturity_values >= self.maturity_threshold)
+                valid_indices = valid_mask.nonzero(as_tuple=True)[0]
 
-                        self.utility[name].flatten()[valid_indices] = 0
-                        self.maturity[name].flatten()[valid_indices] = 0
+                # Dynamically determine the number of weights to reset
+                num_to_reset = min(len(valid_indices), int(self.reset_rate * len(utility_values)))
+                selected_indices = valid_indices[:num_to_reset]
 
-                        module_name = name.replace(".weight", "")
-                        module = self.model.get_submodule(module_name)
-
-                        # Generic handling of all possible parameters: bias, weight, running_mean, running_var
-                        param_names_to_reset = ["bias", "weight", "running_mean", "running_var"]
-                        for param_name in param_names_to_reset:
-                            if hasattr(module, param_name) and getattr(module, param_name) is not None:
-                                param_to_reset = getattr(module, param_name)
-                                num_features = param_to_reset.shape[0]
-                                valid_indices_param = valid_indices[valid_indices < num_features]  # Key: Filter indices
-                                if len(valid_indices_param) > 0:  # Prevent indexing empty lists
-                                    param_to_reset.data[valid_indices_param] = (
-                                        0.0 if param_name in ["bias", "running_mean"] else
-                                        1.0 if param_name in ["weight", "running_var"] else
-                                        None
-                                    )
+                if len(selected_indices) > 0:
+                    self.reset_weights(param, selected_indices)
+                    self.utility[name].view(-1)[selected_indices] = 0
+                    self.maturity[name].view(-1)[selected_indices] = 0
 
     def increment_maturity(self):
-        """
-        Increments the maturity of all units.
-        """
-        for name in self.maturity:
-            self.maturity[name] += 1
+        """Dynamically increment maturity based on gradient contributions."""
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad_contribution = torch.abs(param.grad) * (torch.abs(param) + 1e-8)
+                # Increment maturity for weights with significant gradient contributions
+                avg_contribution = grad_contribution.mean()
+                std_contribution = grad_contribution.std()
+                dynamic_threshold = avg_contribution + std_contribution
+                self.maturity[name] += (grad_contribution > dynamic_threshold).long()
 
-    def step(self):
-        """
-        Performs a single update step: update utility, selective reset, and increment maturity.
-        """
-        self.update_utility()
+    def step(self, current_step, step_interval=1):
+        """Perform a single step of the continual backpropagation process."""
+        # Update utility values (vectorized operations)
+        self.update_utility(current_step, step_interval)
+
+        # Selectively reset weights (dynamic threshold with freezing mechanism)
         self.selective_reset()
+
+        # Dynamically increment maturity
         self.increment_maturity()
+
+
 
 # # Example usage
 # class SimpleNet(nn.Module):
