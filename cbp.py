@@ -1,10 +1,8 @@
 import numpy as np
-from scipy import stats
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.init as init
-import matplotlib.pyplot as plt
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
