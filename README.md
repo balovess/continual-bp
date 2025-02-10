@@ -33,5 +33,3 @@ https://github.com/shibhansh/loss-of-plasticity
 
 ```bash
 pip install torch
-
-
